@@ -1296,6 +1296,17 @@ config TOUCHSCREEN_RAYDIUM_CHIPSET
 
 	  If unsure, say N.
 
+config TOUCHSCREEN_GEN_VKEYS
+       tristate "Touchscreen Virtual Keys Driver"
+       help
+         Say Y here if you want to generate a sysfs entry for virtual
+	 keys on Android.
+
+         If unsure, say N.
+
+         To compile this driver as a module, choose M here: the
+         module will be called gen_vkeys.
+
 source "drivers/input/touchscreen/focaltech_mmi/Kconfig"
 source "drivers/input/touchscreen/nova_mmi/Kconfig"
 
