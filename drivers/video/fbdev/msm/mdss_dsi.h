@@ -732,6 +732,9 @@ int mdss_dsi_get_dt_vreg_data(struct device *dev,
 void mdss_dsi_put_dt_vreg_data(struct device *dev,
 	struct dss_module_power *module_power);
 
+int mdss_dsi_pinctrl_set_state(struct mdss_dsi_ctrl_pdata *ctrl_pdata,
+								bool active);
+
 static inline const char *__mdss_dsi_pm_name(enum dsi_pm_type module)
 {
 	switch (module) {
