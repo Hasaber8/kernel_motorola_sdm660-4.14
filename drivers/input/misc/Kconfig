@@ -897,4 +897,11 @@ config INPUT_SX9310_TRIPLE
 	  Say Y to enable the SAR detection application, if N here not to use the
 	  this SAR sensor.
 
+config INPUT_EGISTEC_FPS
+	tristate "Egistec FPS fingerprint sensor"
+	default n
+	help
+	 Say Y here if you wish to include support for EGIS finger print sensor.
+	 If unsure, say N.
+
 endif
