@@ -889,4 +889,12 @@ config INPUT_HISI_POWERKEY
 	  To compile this driver as a module, choose M here: the
 	  module will be called hisi_powerkey.
 
+config INPUT_SX9310_TRIPLE
+	tristate "SX9310_SAR_sensor use triple channels"
+	depends on I2C
+	default n
+	help
+	  Say Y to enable the SAR detection application, if N here not to use the
+	  this SAR sensor.
+
 endif
