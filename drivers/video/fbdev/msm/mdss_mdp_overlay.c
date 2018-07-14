@@ -1615,7 +1615,8 @@ static int __overlay_queue_pipes(struct msm_fb_data_type *mfd)
 		if (pipe->dirty) {
 			pr_err("fb%d: pipe %d dirty! skipping configuration\n",
 					mfd->index, pipe->num);
-			continue;
+			ret = -EINVAL;
+			goto unstage_pipe_and_clean_buf;
 		}
 
 		/*
@@ -1626,7 +1627,8 @@ static int __overlay_queue_pipes(struct msm_fb_data_type *mfd)
 			!(pipe->flags & MDP_SECURE_DISPLAY_OVERLAY_SESSION)) {
 			pr_warn("Non secure pipe during secure display: %u: %16llx, skip\n",
 					pipe->num, pipe->flags);
-			continue;
+			ret = -EINVAL;
+			goto unstage_pipe_and_clean_buf;
 		}
 		/*
 		 * When external is connected and no dedicated wfd is present,
@@ -1720,7 +1722,8 @@ static int __overlay_queue_pipes(struct msm_fb_data_type *mfd)
 		if (!IS_ERR_VALUE((unsigned long) ret))
 			ret = mdss_mdp_pipe_queue_data(pipe, buf);
 
-		if (IS_ERR_VALUE((unsigned long) ret)) {
+unstage_pipe_and_clean_buf:
+		if (IS_ERR_VALUE(ret)) {
 			pr_warn("Unable to queue data for pnum=%d rect=%d\n",
 					pipe->num, pipe->multirect.num);
 
