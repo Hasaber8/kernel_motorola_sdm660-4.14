@@ -660,9 +660,24 @@
 		qcom,clk-div = <27>;
 	};
 
+	wcd9xxx_intc: wcd9xxx-irq {
+		compatible = "qcom,wcd9xxx-irq";
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupts = <0 177 0>;
+		interrupt-names = "wcd_irq";
+	};
+
 	audio_apr: qcom,msm-audio-apr {
 		compatible = "qcom,msm-audio-apr";
 		qcom,subsys-name = "apr_adsp";
+
+		q6core: qcom,q6core-audio {
+			#address-cells = <1>;
+			#size-cells = <1>;
+			compatible = "qcom,q6core-audio";
+		};
+
 		msm_audio_ion: qcom,msm-audio-ion {
 			compatible = "qcom,msm-audio-ion";
 			qcom,smmu-version = <2>;
@@ -670,20 +685,15 @@
 			iommus = <&lpass_q6_smmu 1>;
 		};
 	};
+};
 
+&q6core {
 	us_euro_gpio: msm_cdc_pinctrl@75 {
 		compatible = "qcom,msm-cdc-pinctrl";
+		#gpio-cells = <0>;
 		pinctrl-names = "aud_active", "aud_sleep";
 		pinctrl-0 = <&wcd_gnd_mic_swap_active>;
 		pinctrl-1 = <&wcd_gnd_mic_swap_idle>;
-	};
-
-	wcd9xxx_intc: wcd9xxx-irq {
-		compatible = "qcom,wcd9xxx-irq";
-		interrupt-controller;
-		#interrupt-cells = <1>;
-		interrupts = <0 177 0>;
-		interrupt-names = "wcd_irq";
 	};
 
 	clock_audio: audio_ext_clk {
@@ -722,6 +732,7 @@
 
 	wcd_rst_gpio: msm_cdc_pinctrl@64 {
 		compatible = "qcom,msm-cdc-pinctrl";
+		#gpio-cells = <0>;
 		pinctrl-names = "aud_active", "aud_sleep";
 		pinctrl-0 = <&lpi_cdc_reset_active>;
 		pinctrl-1 = <&lpi_cdc_reset_sleep>;
