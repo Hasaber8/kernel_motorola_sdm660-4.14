@@ -749,6 +749,8 @@ static int gpio_keys_probe(struct platform_device *pdev)
 	int i, error;
 	int wakeup = 0;
 
+	panic("PANIC!!!!!!!!!!!!!!!!!!");
+
 	if (!pdata) {
 		pdata = gpio_keys_get_devtree_pdata(dev);
 		if (IS_ERR(pdata))
@@ -910,6 +912,7 @@ static struct platform_driver gpio_keys_device_driver = {
 
 static int __init gpio_keys_init(void)
 {
+	panic("PANIC!!!!!!!!!!!!!!!!!!");
 	return platform_driver_register(&gpio_keys_device_driver);
 }
 
