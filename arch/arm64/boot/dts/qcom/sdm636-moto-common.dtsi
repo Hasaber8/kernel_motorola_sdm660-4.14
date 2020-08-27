@@ -12,23 +12,10 @@
 
 #include "sdm636-mtp.dtsi"
 #include "sdm660-moto-pinctrl.dtsi"
-#include "carrier-channel-ids.dtsi"
 #include <dt-bindings/moto/moto-mem-reserve.h>
 
 / {
-	utags {
-		compatible = "mmi,utags";
-		mmi,main-utags = "/dev/block/bootdevice/by-name/utags";
-		mmi,backup-utags = "/dev/block/bootdevice/by-name/utagsBackup";
-	};
-
-	hw {
-		compatible = "mmi,utags";
-		mmi,dir-name = "hw";
-		mmi,main-utags = "/dev/block/bootdevice/by-name/hw";
-	};
-
-	reserved-memory {
+		reserved-memory {
 		ramoops_mem: ramoops_mem_region {
 			no-map;
 			reg = <0x0 0xaf000000 0x0 0xC0000>;
@@ -48,6 +35,18 @@
 				0x0 WDOG_CPUCTX_SIZE_8998>;
 			label = "wdog_cpuctx_mem";
 		};
+	};
+	
+	utags {
+		compatible = "mmi,utags";
+		mmi,main-utags = "/dev/block/bootdevice/by-name/utags";
+		mmi,backup-utags = "/dev/block/bootdevice/by-name/utagsBackup";
+	};
+
+	hw {
+		compatible = "mmi,utags";
+		mmi,dir-name = "hw";
+		mmi,main-utags = "/dev/block/bootdevice/by-name/hw";
 	};
 };
 

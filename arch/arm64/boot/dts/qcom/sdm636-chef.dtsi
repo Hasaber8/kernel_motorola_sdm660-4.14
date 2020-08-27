@@ -26,6 +26,10 @@
 
 &firmware {
 	android {
+		vbmeta {
+			status = "disabled";
+		};
+
 		fstab {
 			vendor {
 				fsmgr_flags = "wait,slotselect,verify";
