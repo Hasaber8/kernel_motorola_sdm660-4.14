@@ -87,8 +87,6 @@
 #define FTS_CHIP_IDC(x)		(((x) & FLAGBIT(FLAG_IDC_BIT)) == \
 					FLAGBIT(FLAG_IDC_BIT))
 
-#define AL2_FCS_COEF		((1 << 15) + (1 << 10) + (1 << 3))
-
 #define FTS_DEBUG		pr_debug
 #define FTS_ERROR		pr_err
 #define FTS_INFO		pr_info
@@ -135,6 +133,7 @@ struct ft_chip_t {
 struct fts_upgrade_fun {
 	int (*get_app_bin_file_ver)(const char *);
 	int (*upgrade_with_app_bin_file)(struct i2c_client *, const char *);
+	int (*erase_fw)(struct i2c_client *);
 	int (*upgrade_with_lcd_cfg_bin_file)(struct i2c_client *, const char *);
 };
 
@@ -172,9 +171,13 @@ extern int fts_ctpm_write_pramboot_for_idc(struct i2c_client *client,
 					u32 length, const u8 *readbuf);
 extern int fts_ctpm_write_app_for_idc(struct i2c_client *client,
 					u32 length, const u8 *readbuf);
-#ifdef CONFIG_TOUCHSCREEN_FOCALTECH_UPGRADE_8716
+#ifdef CONFIG_TOUCHSCREEN_FOCALTECH_UPGRADE_8716_MMI
 extern void ft8716_set_upgrade_function(struct fts_upgrade_fun **curr);
 extern void ft8716_set_chip_id(struct ft_chip_t **curr);
+#endif
+#ifdef CONFIG_TOUCHSCREEN_FOCALTECH_UPGRADE_5X46_MMI
+extern void ft5x46_set_upgrade_function(struct fts_upgrade_fun **curr);
+extern void ft5x46_set_chip_id(struct ft_chip_t **curr);
 #endif
 
 #endif

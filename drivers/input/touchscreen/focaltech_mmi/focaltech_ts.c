@@ -36,6 +36,7 @@
 #include <linux/kobject.h>
 #include <linux/sysfs.h>
 #include <linux/proc_fs.h>
+#include <soc/qcom/bootinfo.h>
 #if defined(CONFIG_TOUCHSCREEN_FOCALTECH_UPGRADE_MMI)
 #include "focaltech_flash.h"
 #endif
@@ -61,6 +62,7 @@ static irqreturn_t ft_ts_interrupt(int irq, void *data);
 
 #include <linux/usb.h>
 #include <linux/power_supply.h>
+#include <linux/reboot.h>
 
 #define FT_DRIVER_VERSION	0x02
 
@@ -223,6 +225,8 @@ static irqreturn_t ft_ts_interrupt(int irq, void *data);
 #define PINCTRL_STATE_SUSPEND	"pmx_ts_suspend"
 #define PINCTRL_STATE_RELEASE	"pmx_ts_release"
 
+#define EXP_FN_DET_INTERVAL 1000 /* ms */
+
 static irqreturn_t ft_ts_interrupt(int irq, void *data);
 
 enum {
@@ -276,8 +280,14 @@ enum {
 	PROC_READ_DATA		= 7
 };
 
+struct ft_clip_area {
+	unsigned xul_clip, yul_clip, xbr_clip, ybr_clip;
+	unsigned inversion; /* clip inside (when 1) or ouside otherwise */
+};
+
 enum {
 	FT_MOD_CHARGER,
+	FT_MOD_FPS,
 	FT_MOD_MAX
 };
 
@@ -292,6 +302,7 @@ struct config_modifier {
 	const char *name;
 	int id;
 	bool effective;
+	struct ft_clip_area *clipa;
 	struct list_head link;
 };
 
@@ -341,6 +352,7 @@ struct ft_ts_data {
 	bool irq_enabled;
 	struct proc_dir_entry *proc_entry;
 	u8 proc_operate_mode;
+	struct notifier_block ft_reboot;
 	/* moto TP modifiers */
 	bool patching_enabled;
 	struct ft_modifiers modifiers;
@@ -348,11 +360,124 @@ struct ft_ts_data {
 	struct work_struct ps_notify_work;
 	struct notifier_block ps_notif;
 	bool ps_is_present;
+
+	bool fps_detection_enabled;
+	bool is_fps_registered;	/* FPS notif registration might be delayed */
+	struct notifier_block fps_notif;
+
+	bool clipping_on;
+	struct ft_clip_area *clipa;
 };
+
+struct ft_exp_fn {
+	bool inserted;
+	int (*func_init)(struct ft_ts_data *data);
+	void (*func_remove)(struct ft_ts_data *data);
+	void (*func_attn)(struct ft_ts_data *data, unsigned char intr_mask);
+	struct list_head link;
+};
+
+struct ft_exp_fn_ctrl {
+	bool inited;
+	struct mutex list_mutex;
+	struct list_head fn_list;
+	struct delayed_work det_work;
+	struct workqueue_struct *det_workqueue;
+	struct ft_ts_data *data_ptr;
+};
+static DEFINE_MUTEX(exp_fn_ctrl_mutex);
+static struct ft_exp_fn_ctrl exp_fn_ctrl;
+
+
+struct touch_up_down {
+	int mismatch;
+	unsigned char up_down;
+	unsigned int counter;
+};
+
+struct touch_area_stats {
+	struct touch_up_down *ud;
+	ssize_t ud_len;
+	ssize_t ud_id;
+	ssize_t unknown_counter;
+	const char *name;
+};
+
+static struct touch_up_down display_ud[20];
+static struct touch_area_stats display_ud_stats = {
+	.ud = display_ud,
+	.ud_len = ARRAY_SIZE(display_ud),
+	.name = "ts"
+};
+
+__attribute__((weak))
+int FPS_register_notifier(struct notifier_block *nb, unsigned long stype,
+			bool report)
+{
+	return -ENODEV;
+}
+
+__attribute__((weak))
+int FPS_unregister_notifier(struct notifier_block *nb, unsigned long stype)
+{
+	return -ENODEV;
+}
+
+static void ud_set_id(struct touch_area_stats *tas, int id)
+{
+	tas->ud_id = id;
+}
+
+static void ud_log_status(struct touch_area_stats *tas, bool down)
+{
+	struct touch_up_down *ud = tas->ud;
+	ssize_t id = tas->ud_id;
+
+	if (id >= tas->ud_len)
+		tas->unknown_counter++;
+
+	if (!down) { /* up */
+		if (ud[id].up_down == 0x10) {
+			pr_debug("%s UP[%zu]\n", tas->name, id);
+			ud[id].up_down |= 1;
+			ud[id].mismatch--;
+		}
+	} else if (down) { /* down */
+		if (ud[id].up_down == 0) {
+			ud[id].up_down |= (1 << 4);
+			pr_debug("%s DOWN[%zu]\n", tas->name, id);
+			ud[id].mismatch++;
+		} else if (ud[id].up_down == 0x10)
+			return;
+	}
+
+	if (ud[id].up_down == 0x11) {
+		pr_debug("%s CLEAR[%zu]\n", tas->name, id);
+		ud[id].up_down = 0;
+		ud[id].counter++;
+	}
+}
+
+static void TSI_state(struct input_dev *dev, unsigned int tool, bool status)
+{
+	ud_log_status(&display_ud_stats, status);
+	input_mt_report_slot_state(dev, tool, status);
+}
+
+static void TSI_id(struct input_dev *dev, int id)
+{
+	ud_set_id(&display_ud_stats, id);
+	input_mt_slot(dev, id);
+}
+
+#define input_mt_report_slot_state TSI_state
+#define input_mt_slot TSI_id
 
 static int ft_ts_start(struct device *dev);
 static int ft_ts_stop(struct device *dev);
 static void ft_resume_ps_chg_cm_state(struct ft_ts_data *data);
+static struct config_modifier *ft_modifier_by_id(
+	struct ft_ts_data *data, int id);
 
 #if defined(CONFIG_TOUCHSCREEN_FOCALTECH_SECURE_TOUCH_MMI)
 static void ft_secure_touch_init(struct ft_ts_data *data)
@@ -733,6 +858,20 @@ static void ft_update_fw_id(struct ft_ts_data *data)
 		data->fw_id[0], data->fw_id[1]);
 }
 
+static void ft_ud_fix_mismatch(struct ft_ts_data *data)
+{
+	int i;
+	struct input_dev *ip_dev = data->input_dev;
+
+	for (i = 0; i < display_ud_stats.ud_len; i++) {
+		if (display_ud[i].mismatch) {
+			pr_debug("%s MISMATCH[%d]\n", display_ud_stats.name, i);
+			input_mt_slot(ip_dev, i);
+			input_mt_report_slot_state(ip_dev, MT_TOOL_FINGER, 0);
+		}
+	}
+}
+
 static irqreturn_t ft_ts_interrupt(int irq, void *dev_id)
 {
 	struct ft_ts_data *data = dev_id;
@@ -781,6 +920,11 @@ static irqreturn_t ft_ts_interrupt(int irq, void *dev_id)
 		y = (buf[FT_TOUCH_Y_H_POS + FT_ONE_TCH_LEN * i] & 0x0F) << 8 |
 			(buf[FT_TOUCH_Y_L_POS + FT_ONE_TCH_LEN * i]);
 
+		if (data->pdata->x_flip)
+			x = data->pdata->x_max - x;
+		if (data->pdata->y_flip)
+			y = data->pdata->y_max - y;
+
 		status = buf[FT_TOUCH_EVENT_POS + FT_ONE_TCH_LEN * i] >> 6;
 
 		num_touches = buf[FT_TD_STATUS] & FT_STATUS_NUM_TP_MASK;
@@ -788,6 +932,28 @@ static irqreturn_t ft_ts_interrupt(int irq, void *dev_id)
 		/* invalid combination */
 		if (!num_touches && !status && !id)
 			break;
+
+		if (data->clipping_on && data->clipa) {
+			bool inside;
+
+			inside = (x >= data->clipa->xul_clip) &&
+				(x <= data->clipa->xbr_clip) &&
+				(y >= data->clipa->yul_clip) &&
+				(y <= data->clipa->ybr_clip);
+
+			if (inside == data->clipa->inversion) {
+				/* Touch might still be active, but we're */
+				/* sending release anyway to avoid touch  */
+				/* stuck at the last reported position.   */
+				/* Driver will suppress reporting to UI   */
+				/* touch events from within clipping area */
+				status = 1;
+
+				dev_dbg(&data->client->dev,
+					"finger id-%d (%d,%d) within clipping area\n",
+					id, x, y);
+			}
+		}
 
 		input_mt_slot(ip_dev, id);
 		if (status == FT_TOUCH_DOWN || status == FT_TOUCH_CONTACT) {
@@ -798,6 +964,10 @@ static irqreturn_t ft_ts_interrupt(int irq, void *dev_id)
 			input_mt_report_slot_state(ip_dev, MT_TOOL_FINGER, 0);
 		}
 	}
+
+	/* report up event if FW missed to do */
+	if (num_touches == 0)
+		ft_ud_fix_mismatch(data);
 
 	if (update_input) {
 		input_mt_report_pointer_emulation(ip_dev, false);
@@ -1033,6 +1203,25 @@ err_pinctrl_get:
 	return retval;
 }
 
+static ssize_t ft_ud_stat(struct ft_ts_data *data, char *buf, ssize_t size)
+{
+	int i;
+	ssize_t total = 0;
+
+	total += scnprintf(buf + total, size - total, "screen: ");
+	for (i = 0; i < display_ud_stats.ud_len; i++)
+		if (display_ud[i].mismatch)
+			total += scnprintf(buf + total, size - total,
+				"%d)%u,%d ", i,
+				display_ud[i].counter,
+				display_ud[i].mismatch);
+		else if (display_ud[i].counter)
+			total += scnprintf(buf + total, size - total,
+				"%d)%u ", i,
+				display_ud[i].counter);
+	return total;
+}
+
 #ifdef CONFIG_PM
 static int ft_ts_start(struct device *dev)
 {
@@ -1096,10 +1285,14 @@ static int ft_ts_stop(struct device *dev)
 {
 	struct ft_ts_data *data = dev_get_drvdata(dev);
 	char txbuf[2];
+	static char ud_stats[PAGE_SIZE];
 	int i, err;
 
 	ft_irq_disable(data);
 
+	/* print UD statistics */
+	ft_ud_stat(data, ud_stats, sizeof(ud_stats));
+	pr_info("%s\n", ud_stats);
 	/* release all touches */
 	for (i = 0; i < data->pdata->num_max_touches; i++) {
 		input_mt_slot(data->input_dev, i);
@@ -1456,6 +1649,168 @@ static int ps_notify_callback(struct notifier_block *self,
 	return 0;
 }
 
+static void ft_detection_work(struct work_struct *work)
+{
+	struct ft_exp_fn *exp_fhandler, *next_list_entry;
+	struct ft_ts_data *data;
+	int error;
+	bool det_again = false;
+
+	mutex_lock(&exp_fn_ctrl_mutex);
+	data = exp_fn_ctrl.data_ptr;
+	mutex_unlock(&exp_fn_ctrl_mutex);
+
+	if (data == NULL) {
+		if (exp_fn_ctrl.det_workqueue)
+			queue_delayed_work(exp_fn_ctrl.det_workqueue,
+				&exp_fn_ctrl.det_work,
+				msecs_to_jiffies(EXP_FN_DET_INTERVAL));
+		return;
+	}
+
+	mutex_lock(&exp_fn_ctrl.list_mutex);
+	if (list_empty(&exp_fn_ctrl.fn_list))
+		goto release_mutex;
+
+	list_for_each_entry_safe(exp_fhandler,
+				next_list_entry,
+				&exp_fn_ctrl.fn_list,
+				link) {
+		if (exp_fhandler->func_init == NULL) {
+			if (exp_fhandler->inserted == true) {
+				if (exp_fhandler->func_init != NULL)
+					exp_fhandler->func_remove(data);
+				list_del(&exp_fhandler->link);
+				kfree(exp_fhandler);
+			}
+			continue;
+		}
+
+		if (exp_fhandler->inserted == true)
+			continue;
+
+		error = exp_fhandler->func_init(data);
+		if (error < 0) {
+			pr_err("Failed to init exp function. err=%d\n", error);
+			det_again = true;
+			continue;
+		}
+		exp_fhandler->inserted = true;
+	}
+
+release_mutex:
+	mutex_unlock(&exp_fn_ctrl.list_mutex);
+	if (det_again) {
+		if (exp_fn_ctrl.det_workqueue)
+			queue_delayed_work(exp_fn_ctrl.det_workqueue,
+				&exp_fn_ctrl.det_work,
+				msecs_to_jiffies(EXP_FN_DET_INTERVAL));
+	}
+}
+
+void ft_new_function(bool insert,
+		int (*func_init)(struct ft_ts_data *data),
+		void (*func_remove)(struct ft_ts_data *data),
+		void (*func_attn)(struct ft_ts_data *data,
+					unsigned char intr_mask))
+{
+	struct ft_exp_fn *exp_fhandler;
+
+	mutex_lock(&exp_fn_ctrl_mutex);
+	if (!exp_fn_ctrl.inited) {
+		mutex_init(&exp_fn_ctrl.list_mutex);
+		INIT_LIST_HEAD(&exp_fn_ctrl.fn_list);
+		exp_fn_ctrl.det_workqueue =
+			create_singlethread_workqueue("rmi_det_workqueue");
+		if (IS_ERR_OR_NULL(exp_fn_ctrl.det_workqueue))
+			pr_err("unable to create a workqueue\n");
+		INIT_DELAYED_WORK(&exp_fn_ctrl.det_work,
+			ft_detection_work);
+		exp_fn_ctrl.inited = true;
+	}
+	mutex_unlock(&exp_fn_ctrl_mutex);
+
+	mutex_lock(&exp_fn_ctrl.list_mutex);
+	if (insert) {
+		exp_fhandler = kzalloc(sizeof(*exp_fhandler), GFP_KERNEL);
+		if (!exp_fhandler) {
+			pr_err("failed to alloc mem for expansion function\n");
+			goto exit;
+		}
+		exp_fhandler->func_init = func_init;
+		exp_fhandler->func_attn = func_attn;
+		exp_fhandler->func_remove = func_remove;
+		exp_fhandler->inserted = false;
+		list_add_tail(&exp_fhandler->link, &exp_fn_ctrl.fn_list);
+	} else {
+		list_for_each_entry(exp_fhandler, &exp_fn_ctrl.fn_list, link) {
+			if (exp_fhandler->func_init == func_init) {
+				exp_fhandler->inserted = false;
+				exp_fhandler->func_init = NULL;
+				exp_fhandler->func_attn = NULL;
+				goto exit;
+			}
+		}
+	}
+
+exit:
+	mutex_unlock(&exp_fn_ctrl.list_mutex);
+	if (exp_fn_ctrl.det_workqueue)
+		queue_delayed_work(exp_fn_ctrl.det_workqueue,
+					&exp_fn_ctrl.det_work, 0);
+}
+EXPORT_SYMBOL(ft_new_function);
+
+static int fps_notifier_callback(struct notifier_block *self,
+				unsigned long event, void *p)
+{
+	int fps_state = *(int *)p;
+	struct ft_ts_data *data =
+		container_of(self, struct ft_ts_data, fps_notif);
+
+	if (data && event == 0xBEEF && data->client) {
+		struct config_modifier *cm =
+			ft_modifier_by_id(data, FT_MOD_FPS);
+		if (!cm) {
+			dev_err(&data->client->dev,
+				"No FPS modifier found\n");
+			goto done;
+		}
+
+		if (fps_state) {/* on */
+			data->clipping_on = true;
+			data->clipa = cm->clipa;
+			cm->effective = true;
+		} else {/* off */
+			data->clipping_on = false;
+			data->clipa = NULL;
+			cm->effective = false;
+		}
+		pr_info("FPS: clipping is %s\n",
+			data->clipping_on ? "ON" : "OFF");
+	}
+done:
+	return 0;
+}
+
+static int ft_fps_register_init(struct ft_ts_data *data)
+{
+	int retval;
+
+	retval = FPS_register_notifier(&data->fps_notif, 0xBEEF, false);
+	if (retval < 0) {
+		dev_err(&data->client->dev,
+			"Failed to register fps_notifier: %d\n", retval);
+		return retval;
+	}
+	data->is_fps_registered = true;
+	dev_info(&data->client->dev,
+			"Register fps_notifier OK\n");
+
+	return 0;
+}
+
+#if !defined(CONFIG_TOUCHSCREEN_FOCALTECH_UPGRADE_MMI)
 static int ft_auto_cal(struct i2c_client *client)
 {
 	struct ft_ts_data *data = i2c_get_clientdata(client);
@@ -1793,6 +2148,7 @@ rel_fw:
 	release_firmware(fw);
 	return rc;
 }
+#endif
 
 static ssize_t ft_poweron_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
@@ -1913,7 +2269,7 @@ static ssize_t ft_do_reflash_store(struct device *dev,
 	mutex_lock(&data->input_dev->mutex);
 	ft_irq_disable(data);
 	data->loading_fw = true;
-#if defined(CONFIG_TOUCHSCREEN_FOCALTECH_UPGRADE)
+#if defined(CONFIG_TOUCHSCREEN_FOCALTECH_UPGRADE_MMI)
 		retval = fts_ctpm_auto_upgrade(data->client,
 				data->fw_name,
 				data->pdata);
@@ -1936,6 +2292,50 @@ exit:
 }
 
 static DEVICE_ATTR(doreflash, 0220, NULL, ft_do_reflash_store);
+
+static ssize_t ft_eraseall_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct ft_ts_data *data = dev_get_drvdata(dev);
+	unsigned int input;
+	int retval=0;
+
+	if (sscanf(buf, "%u", &input) != 1)
+		return -EINVAL;
+	/* Check for suspend state */
+	if (data->suspended) {
+		dev_err(&data->client->dev,
+			"%s: In suspend state, try again later\n",
+			__func__);
+		retval = -EINVAL;
+	}
+	/* Check for FW loading state */
+	if (data->loading_fw) {
+		dev_err(&data->client->dev,
+			"%s: In FW flashing state, try again later\n",
+			__func__);
+		retval = -EINVAL;
+	}
+	mutex_lock(&data->input_dev->mutex);
+	ft_irq_disable(data);
+	data->loading_fw = true;
+#if defined(CONFIG_TOUCHSCREEN_FOCALTECH_UPGRADE_MMI)
+	pr_debug("Erase for ft5x46\n");
+	retval = fts_ctpm_erase_fw(data->client, data->pdata);
+#endif
+	if ( retval < 0 )
+		pr_debug("FW erase failed\n");
+	else
+		pr_debug("FW erase complete\n");
+	/* After erase Enable IRQ */
+	ft_irq_enable(data);
+	data->loading_fw = false;
+	mutex_unlock(&data->input_dev->mutex);
+	retval = count;
+	return count;
+}
+
+static DEVICE_ATTR(erase_all, 0220, NULL, ft_eraseall_store);
 
 static ssize_t ft_build_id_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
@@ -2018,6 +2418,24 @@ static ssize_t ft_drv_irq_store(struct device *dev,
 
 static DEVICE_ATTR(drv_irq, 0664, ft_drv_irq_show, ft_drv_irq_store);
 
+static ssize_t ft_ud_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	int i;
+	ssize_t total = 0;
+
+	total += scnprintf(buf + total, PAGE_SIZE - total, "display:\n");
+	for (i = 0; i < display_ud_stats.ud_len; i++)
+		total += scnprintf(buf + total, PAGE_SIZE - total,
+				"[%d]: full cycles-%u, mismatch-%d\n", i,
+				display_ud[i].counter,
+				display_ud[i].mismatch);
+
+	return total;
+}
+
+static DEVICE_ATTR(tsi, 0444, ft_ud_show, NULL);
+
 static const struct attribute *ft_attrs[] = {
 	&dev_attr_poweron.attr,
 	&dev_attr_productinfo.attr,
@@ -2027,6 +2445,12 @@ static const struct attribute *ft_attrs[] = {
 	&dev_attr_buildid.attr,
 	&dev_attr_reset.attr,
 	&dev_attr_drv_irq.attr,
+	&dev_attr_tsi.attr,
+	NULL
+};
+
+static const struct attribute *ft_erase_attr[] = {
+	&dev_attr_erase_all.attr,
 	NULL
 };
 
@@ -2476,7 +2900,7 @@ static int ft_get_dt_coords(struct device *dev, char *name,
 }
 
 /* ASCII names order MUST match enum */
-static const char const *ascii_names[] = {"charger", "na"};
+static const char const *ascii_names[] = {"charger", "fps", "na"};
 
 static int ft_modifier_name2id(const char *name)
 {
@@ -2492,6 +2916,57 @@ static int ft_modifier_name2id(const char *name)
 	return chosen;
 }
 
+static struct config_modifier *ft_modifier_by_id(
+	struct ft_ts_data *data, int id)
+{
+	struct config_modifier *cm, *found = NULL;
+
+	down(&data->modifiers.list_sema);
+	list_for_each_entry(cm, &data->modifiers.mod_head, link) {
+		pr_debug("walk-thru: ptr=%p modifier[%s] id=%d\n",
+					cm, cm->name, cm->id);
+		if (cm->id == id) {
+			found = cm;
+			break;
+		}
+	}
+	up(&data->modifiers.list_sema);
+	pr_debug("returning modifier id=%d[%d]\n", found ? found->id : -1, id);
+	return found;
+}
+
+static void ft_dt_parse_modifier(struct ft_ts_data *data,
+		struct device_node *parent, struct config_modifier *config,
+		const char *modifier_name, bool active)
+{
+	struct device *dev = &data->client->dev;
+	char node_name[64];
+	struct ft_clip_area clipa;
+	struct device_node *np_config;
+	int err;
+
+	scnprintf(node_name, 63, "%s-%s", modifier_name,
+			active ? "active" : "suspended");
+	np_config = of_find_node_by_name(parent, node_name);
+	if (!np_config) {
+		dev_dbg(dev, "%s: node does not exist\n", node_name);
+		return;
+	}
+
+	err = of_property_read_u32_array(np_config, "touch-clip-area",
+		(unsigned int *)&clipa, sizeof(clipa)/sizeof(unsigned int));
+	if (!err) {
+		config->clipa = kzalloc(sizeof(clipa), GFP_KERNEL);
+		if (!config->clipa) {
+			dev_err(dev, "clip area allocation failure\n");
+			return;
+		}
+		memcpy(config->clipa, &clipa, sizeof(clipa));
+		pr_notice("using touch clip area in %s\n", node_name);
+	}
+
+	of_node_put(np_config);
+}
 
 static int ft_dt_parse_modifiers(struct ft_ts_data *data)
 {
@@ -2567,6 +3042,10 @@ static int ft_dt_parse_modifiers(struct ft_ts_data *data)
 				pr_notice("using charger detection\n");
 				data->charger_detection_enabled = true;
 				break;
+			case FT_MOD_FPS:
+				pr_notice("using fingerprint sensor detection\n");
+				data->fps_detection_enabled = true;
+				break;
 			default:
 				pr_notice("no notification found\n");
 				break;
@@ -2576,6 +3055,14 @@ static int ft_dt_parse_modifiers(struct ft_ts_data *data)
 			dev_dbg(dev, "modifier %s enabled unconditionally\n",
 					node_name);
 		}
+
+		dev_dbg(dev, "processing modifier %s[%d]\n",
+				node_name, config->id);
+
+		ft_dt_parse_modifier(data, np_mod, config,
+				modifiers_names[i], true);
+		ft_dt_parse_modifier(data, np_mod, config,
+				modifiers_names[i], false);
 
 		of_node_put(np_mod);
 	}
@@ -2715,6 +3202,16 @@ static int ft_parse_dt(struct device *dev,
 	pdata->resume_in_workqueue = of_property_read_bool(np,
 					"focaltech,resume-in-workqueue");
 
+	if (of_property_read_bool(np, "focaltech,x-flip")) {
+		pr_notice("using flipped X axis\n");
+		pdata->x_flip = true;
+	}
+
+	if (of_property_read_bool(np, "focaltech,y-flip")) {
+		pr_notice("using flipped Y axis\n");
+		pdata->y_flip = true;
+	}
+
 	rc = of_property_read_u32(np, "focaltech,family-id", &temp_val);
 	if (!rc)
 		pdata->family_id = temp_val;
@@ -2745,6 +3242,59 @@ static int ft_parse_dt(struct device *dev,
 	return -ENODEV;
 }
 #endif
+
+static int ft_reboot(struct notifier_block *nb,
+			unsigned long event,
+			void *unused)
+{
+	struct ft_ts_data *data =
+		container_of(nb, struct ft_ts_data, ft_reboot);
+
+	dev_info(&data->client->dev, "touch shutdown\n");
+
+	if (data->is_fps_registered) {
+		FPS_unregister_notifier(&data->fps_notif, 0xBEEF);
+		data->is_fps_registered = false;
+	}
+
+	if (data->charger_detection_enabled) {
+		power_supply_unreg_notifier(&data->ps_notif);
+		data->charger_detection_enabled = false;
+	}
+
+#if defined(CONFIG_FB)
+	fb_unregister_client(&data->fb_notif);
+#elif defined(CONFIG_HAS_EARLYSUSPEND)
+	unregister_early_suspend(&data->early_suspend);
+#endif
+
+	if (data->irq_enabled) {
+		ft_irq_disable(data);
+		free_irq(data->client->irq, data);
+	}
+
+	if (gpio_is_valid(data->pdata->reset_gpio)) {
+		gpio_direction_output(data->pdata->reset_gpio, 0);
+		msleep(data->pdata->hard_rst_dly);
+		gpio_free(data->pdata->reset_gpio);
+	}
+	if (gpio_is_valid(data->pdata->irq_gpio))
+		gpio_free(data->pdata->irq_gpio);
+
+	if (data->regulator_en) {
+		if (data->pdata->power_on)
+			data->pdata->power_on(false);
+		else
+			ft_power_on(data, false);
+		if (data->pdata->power_init)
+			data->pdata->power_init(false);
+		else
+			ft_power_init(data, false);
+		data->regulator_en = false;
+	}
+
+	return NOTIFY_DONE;
+}
 
 static int ft_ts_probe(struct i2c_client *client,
 			   const struct i2c_device_id *id)
@@ -2792,13 +3342,6 @@ static int ft_ts_probe(struct i2c_client *client,
 	if (!data->tch_data)
 		return -ENOMEM;
 
-	input_dev = input_allocate_device();
-	if (!input_dev) {
-		dev_err(&client->dev, "failed to allocate input device\n");
-		return -ENOMEM;
-	}
-
-	data->input_dev = input_dev;
 	data->client = client;
 	data->pdata = pdata;
 	data->force_reflash = (data->pdata->no_force_update) ? false : true;
@@ -2810,29 +3353,7 @@ static int ft_ts_probe(struct i2c_client *client,
 	if (err)
 		data->patching_enabled = false;
 
-	input_dev->name = "focaltech_ts";
-	input_dev->id.bustype = BUS_I2C;
-	input_dev->dev.parent = &client->dev;
-
-	input_set_drvdata(input_dev, data);
 	i2c_set_clientdata(client, data);
-
-	__set_bit(EV_KEY, input_dev->evbit);
-	__set_bit(EV_ABS, input_dev->evbit);
-	__set_bit(BTN_TOUCH, input_dev->keybit);
-	__set_bit(INPUT_PROP_DIRECT, input_dev->propbit);
-
-	input_mt_init_slots(input_dev, pdata->num_max_touches, 0);
-	input_set_abs_params(input_dev, ABS_MT_POSITION_X, pdata->x_min,
-			     pdata->x_max, 0, 0);
-	input_set_abs_params(input_dev, ABS_MT_POSITION_Y, pdata->y_min,
-			     pdata->y_max, 0, 0);
-
-	err = input_register_device(input_dev);
-	if (err) {
-		dev_err(&client->dev, "Input device registration failed\n");
-		goto input_register_device_err;
-	}
 
 	if (pdata->power_init) {
 		err = pdata->power_init(true);
@@ -2921,6 +3442,35 @@ static int ft_ts_probe(struct i2c_client *client,
 
 	dev_dbg(&client->dev, "touch threshold = %d\n", reg_value * 4);
 
+	input_dev = input_allocate_device();
+	if (!input_dev) {
+		dev_err(&client->dev, "failed to allocate input device\n");
+		goto free_gpio;
+	}
+
+	data->input_dev = input_dev;
+	input_dev->name = "focaltech_ts";
+	input_dev->id.bustype = BUS_I2C;
+	input_dev->dev.parent = &client->dev;
+	input_set_drvdata(input_dev, data);
+
+	__set_bit(EV_KEY, input_dev->evbit);
+	__set_bit(EV_ABS, input_dev->evbit);
+	__set_bit(BTN_TOUCH, input_dev->keybit);
+	__set_bit(INPUT_PROP_DIRECT, input_dev->propbit);
+
+	input_mt_init_slots(input_dev, pdata->num_max_touches, 0);
+	input_set_abs_params(input_dev, ABS_MT_POSITION_X, pdata->x_min,
+			     pdata->x_max, 0, 0);
+	input_set_abs_params(input_dev, ABS_MT_POSITION_Y, pdata->y_min,
+			     pdata->y_max, 0, 0);
+
+	err = input_register_device(input_dev);
+	if (err) {
+		dev_err(&client->dev, "Input device registration failed\n");
+		goto input_register_device_err;
+	}
+
 	err = request_threaded_irq(client->irq, NULL,
 				ft_ts_interrupt,
 	/*
@@ -2931,7 +3481,7 @@ static int ft_ts_probe(struct i2c_client *client,
 				client->dev.driver->name, data);
 	if (err) {
 		dev_err(&client->dev, "request irq failed\n");
-		goto free_gpio;
+		goto request_irq_err;
 	}
 
 	/* request_threaded_irq enable irq,so set the flag irq_enabled */
@@ -2947,6 +3497,14 @@ static int ft_ts_probe(struct i2c_client *client,
 	if (err) {
 		dev_err(&client->dev, "sys files creation failed\n");
 		goto sysfs_create_files_err;
+	}
+
+	if (strncmp(bi_bootmode(), "mot-factory", strlen("mot-factory")) == 0) {
+		err = sysfs_create_files(&client->dev.kobj, ft_erase_attr);
+		if (err) {
+			dev_err(&client->dev, "sys erase file creation failed\n");
+			goto sysfs_create_files_err;
+		}
 	}
 
 	data->dir = debugfs_create_dir(FT_DEBUG_DIR_NAME, NULL);
@@ -3061,6 +3619,21 @@ static int ft_ts_probe(struct i2c_client *client,
 	register_early_suspend(&data->early_suspend);
 #endif
 
+	mutex_lock(&exp_fn_ctrl_mutex);
+	if (!exp_fn_ctrl.inited) {
+		mutex_init(&exp_fn_ctrl.list_mutex);
+		INIT_LIST_HEAD(&exp_fn_ctrl.fn_list);
+		exp_fn_ctrl.det_workqueue =
+			create_singlethread_workqueue("rmi_det_workqueue");
+		if (IS_ERR_OR_NULL(exp_fn_ctrl.det_workqueue))
+			pr_err("unable to create a workqueue\n");
+		INIT_DELAYED_WORK(&exp_fn_ctrl.det_work,
+			ft_detection_work);
+		exp_fn_ctrl.inited = true;
+	}
+	exp_fn_ctrl.data_ptr = data;
+	mutex_unlock(&exp_fn_ctrl_mutex);
+
 	if (data->charger_detection_enabled) {
 		struct power_supply *psy = NULL;
 
@@ -3102,8 +3675,31 @@ static int ft_ts_probe(struct i2c_client *client,
 		}
 	}
 
+	if (data->fps_detection_enabled) {
+		data->fps_notif.notifier_call = fps_notifier_callback;
+		dev_dbg(&client->dev, "registering FPS notifier\n");
+		ft_new_function(true,
+			ft_fps_register_init,
+			NULL,
+			NULL);
+	}
+
+	data->ft_reboot.notifier_call = ft_reboot;
+	data->ft_reboot.next = NULL;
+	data->ft_reboot.priority = 1;
+	err = register_reboot_notifier(&data->ft_reboot);
+	if (err) {
+		dev_err(&client->dev, "register for reboot failed\n");
+		goto reboot_register_err;
+	}
+
 	return 0;
 
+reboot_register_err:
+	if (data->is_fps_registered)
+		FPS_unregister_notifier(&data->fps_notif, 0xBEEF);
+	if (data->charger_detection_enabled)
+		power_supply_unreg_notifier(&data->ps_notif);
 free_fb_notifier:
 #if defined(CONFIG_FB)
 	if (fb_unregister_client(&data->fb_notif))
@@ -3124,11 +3720,18 @@ free_debug_dir:
 	debugfs_remove_recursive(data->dir);
 debugfs_create_dir_err:
 	sysfs_remove_files(&client->dev.kobj, ft_attrs);
+	if (strncmp(bi_bootmode(), "mot-factory", strlen("mot-factory")) == 0)
+		sysfs_remove_files(&client->dev.kobj, ft_erase_attr);
 sysfs_create_files_err:
 	ft_ts_sysfs_class(data, false);
 sysfs_class_err:
 	free_irq(client->irq, data);
 	data->irq_enabled = false;
+request_irq_err:
+	input_unregister_device(input_dev);
+input_register_device_err:
+	data->input_dev = NULL;
+	input_free_device(input_dev);
 free_gpio:
 	ft_gpio_configure(data, false);
 gpio_config_err:
@@ -3155,9 +3758,6 @@ regulator_en_err:
 		pdata->power_init(false);
 	else
 		ft_power_init(data, false);
-	input_unregister_device(input_dev);
-input_register_device_err:
-	input_free_device(input_dev);
 	return err;
 }
 
@@ -3165,6 +3765,17 @@ static int ft_ts_remove(struct i2c_client *client)
 {
 	struct ft_ts_data *data = i2c_get_clientdata(client);
 	int retval, attr_count;
+
+	if (exp_fn_ctrl.inited) {
+		cancel_delayed_work_sync(&exp_fn_ctrl.det_work);
+		flush_workqueue(exp_fn_ctrl.det_workqueue);
+		destroy_workqueue(exp_fn_ctrl.det_workqueue);
+	}
+
+	if (data->is_fps_registered)
+		FPS_unregister_notifier(&data->fps_notif, 0xBEEF);
+
+	unregister_reboot_notifier(&data->ft_reboot);
 
 	if (data->charger_detection_enabled)
 		power_supply_unreg_notifier(&data->ps_notif);
@@ -3184,6 +3795,8 @@ static int ft_ts_remove(struct i2c_client *client)
 	ft_remove_proc_entry(data);
 	debugfs_remove_recursive(data->dir);
 	sysfs_remove_files(&client->dev.kobj, ft_attrs);
+	if (strncmp(bi_bootmode(), "mot-factory", strlen("mot-factory")) == 0)
+		sysfs_remove_files(&client->dev.kobj, ft_erase_attr);
 	ft_ts_sysfs_class(data, false);
 
 	free_irq(client->irq, data);
