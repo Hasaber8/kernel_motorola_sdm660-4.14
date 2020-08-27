@@ -12,10 +12,11 @@
 
 #include "sdm636-mtp.dtsi"
 #include "sdm660-moto-pinctrl.dtsi"
+#include "carrier-channel-ids.dtsi"
 #include <dt-bindings/moto/moto-mem-reserve.h>
 
 / {
-		reserved-memory {
+	reserved-memory {
 		ramoops_mem: ramoops_mem_region {
 			no-map;
 			reg = <0x0 0xaf000000 0x0 0xC0000>;

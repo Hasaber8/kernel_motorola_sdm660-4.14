@@ -110,4 +110,6 @@ obj-$(CONFIG_TOUCHSCREEN_HIMAX_CHIPSET)	+= hxchipset/
 obj-$(CONFIG_TOUCHSCREEN_SYNAPTICS_TCM)	+= synaptics_tcm/
 obj-$(CONFIG_TOUCHSCREEN_RAYDIUM_CHIPSET)  += raydium_wt030/
 obj-$(CONFIG_TOUCHSCREEN_FOCALTECH_MMI) += focaltech_mmi/
+obj-$(CONFIG_TOUCHSCREEN_NT36xxx)	+= nova_mmi/
+
 
