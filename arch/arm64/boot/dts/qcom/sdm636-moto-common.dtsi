@@ -10,9 +10,9 @@
  * GNU General Public License for more details.
  */
 
-#include "sdm636-mtp.dtsi"
+/* #include "sdm636-mtp.dtsi" */
 #include "sdm660-moto-pinctrl.dtsi"
-#include "carrier-channel-ids.dtsi"
+/* #include "carrier-channel-ids.dtsi"  */
 #include <dt-bindings/moto/moto-mem-reserve.h>
 
 / {
@@ -28,7 +28,6 @@
 			ramoops-annotate-size = <0x0 0x800>;
 			no-dump-oops;
 		};
-
 
 		tzlog_bck_mem: tzlog_bck_region {
 			no-map;

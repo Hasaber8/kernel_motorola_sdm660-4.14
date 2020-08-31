@@ -11,13 +11,13 @@
  */
 
 #include "sdm636-moto-common.dtsi"
-#include "sdm636-egis-fps.dtsi"
-#include "dsi-panel-mot-tianma-ft-618-fhd-vid.dtsi"
-#include "dsi-panel-mot-tianma-nt-618-fhd-vid.dtsi"
-#include "dsi-panel-mot-csot-nt-618-fhd-vid.dtsi"
-#include "sdm660-internal-codec.dtsi"
-/* #include "sdm636-chef-audio.dtsi" Breaks compilation */
-#include "sdm636-camera-sensor-mot-chef.dtsi"
+/* #include "sdm636-egis-fps.dtsi"
+ * #include "dsi-panel-mot-tianma-ft-618-fhd-vid.dtsi"
+ * #include "dsi-panel-mot-tianma-nt-618-fhd-vid.dtsi"
+ * #include "dsi-panel-mot-csot-nt-618-fhd-vid.dtsi" 
+ * #include "sdm636-chef-audio.dtsi" Breaks compilation 
+ * #include "sdm636-camera-sensor-mot-chef.dtsi"
+ * #include "sdm660-internal-codec.dtsi" */
 
 / {
 	model = "chef";
@@ -102,14 +102,14 @@
 	hw-config = "single_dsi";
 };
 
-&mdss_dsi0 {
+/* &mdss_dsi0 {
 	qcom,dsi-pref-prim-pan = <&mot_tianma_ft_618_fhd_vid_v0>;
 	pinctrl-names = "mdss_default", "mdss_sleep";
 	pinctrl-0 = <&mdss_dsi_active &mdss_te_active>;
 	pinctrl-1 = <&mdss_dsi_suspend &mdss_te_suspend>;
 	qcom,platform-reset-gpio = <&tlmm 53 0>;
 	qcom,platform-te-gpio = <&tlmm 59 0>;
-};
+}; */
 
 &pm660l_wled {
 	qcom,led-strings-list = [00 01];
